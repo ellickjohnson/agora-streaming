@@ -17,7 +17,7 @@ These scripts assume you have an Agora account with a Customer Key, Customer Sec
 Install the required packages using pip:
 
 ```bash
-pip install requests streamlit python-dotenv rich
+pip install requests streamlit python-dotenv rich agora-token-builder
 ```
 
 - `requests`: For API calls (used in all scripts).

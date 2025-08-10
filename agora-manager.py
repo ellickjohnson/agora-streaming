@@ -3,12 +3,12 @@ import hmac
 import json
 import os
 import random
+import struct
 import subprocess
 import time
 import webbrowser
 from base64 import b64encode
 from hashlib import sha256
-from struct import pack
 from dotenv import load_dotenv  # pip install python-dotenv
 
 import requests
@@ -20,6 +20,65 @@ try:
 except ImportError:
     console = None
     Prompt = input
+
+kJoinChannel = 1
+kPublishAudioStream = 2
+kPublishVideoStream = 3
+kPublishDataStream = 4
+kAdministrateChannel = 101
+
+class Service:
+    TYPE = 0
+
+    def __init__(self):
+        self.privileges = {}
+
+    def add_privilege(self, privilege, expire):
+        self.privileges[privilege] = expire
+
+    def pack(self):
+        packed_privileges = b''
+        for privilege, expire in sorted(self.privileges.items()):
+            packed_privileges += struct.pack('>H', privilege) + struct.pack('>I', expire)
+        return struct.pack('>H', self.TYPE) + struct.pack('>H', len(self.privileges)) + packed_privileges
+
+class AccessToken:
+    def __init__(self, app_id="", app_certificate="", issue_ts=0, expire_time=900):
+        self.app_id = app_id
+        self.app_certificate = app_certificate
+        self.issue_ts = issue_ts if issue_ts else int(time.time())
+        self.expire_time = expire_time
+        self.salt = random.randint(1, 99999999)
+        self.services = {}
+
+    def add_service(self, service):
+        self.services[service.TYPE] = service
+
+    def build(self):
+        packed_services = b''
+        for _, service in self.services.items():
+            packed_services += service.pack()
+
+        packed = struct.pack('>I', self.salt) + struct.pack('>I', self.issue_ts) + struct.pack('>I', self.expire_time) + struct.pack('>H', len(self.services)) + packed_services
+
+        sign_content = self.app_id.encode('utf-8') + packed
+        signature = hmac.new(self.app_certificate.encode('utf-8'), sign_content, sha256).digest()
+        signature_b64 = base64.b64encode(signature).decode('utf-8')
+
+        content_b64 = base64.b64encode(packed).decode('utf-8')
+
+        return "007" + self.app_id + signature_b64 + content_b64
+
+class ServiceRtc(Service):
+    TYPE = 1
+
+    def __init__(self, channel_name="", uid=""):
+        super().__init__()
+        self.channel_name = channel_name
+        self.uid = str(uid) if uid else ""
+
+    def pack(self):
+        return super().pack() + struct.pack('>H', len(self.channel_name)) + self.channel_name.encode('utf-8') + struct.pack('>H', len(self.uid)) + self.uid.encode('utf-8')
 
 class AgoraAPI:
     """Modular class for Agora operations (extendable for Flask endpoints/UI)."""
@@ -51,22 +110,18 @@ class AgoraAPI:
         else:
             return {"hostCount": 0, "userCount": data.get("total", 0)}
 
-    def get_active_channels(self, app_id: str) -> list[dict]:
-        """Get active channels for App ID, with stream status (users/hosts)."""
+    def get_channels(self, app_id: str) -> list[dict]:
+        """Get channels for App ID (API returns only online/active ones), with stream status (users/hosts)."""
         url = f"https://api.agora.io/dev/v1/channel/{app_id}"
         response = requests.get(url, headers=self.auth_header)
         response.raise_for_status()
         channels = response.json().get("data", {}).get("channels", [])
-        active_channels = []
         for ch in channels:
             details = self.get_channel_details(app_id, ch["channel_name"])
-            host_count = details["hostCount"]
-            user_count = details["userCount"]
-            if user_count > 0 or host_count > 0:
-                ch["userCount"] = user_count
-                ch["hostCount"] = host_count
-                active_channels.append(ch)
-        return active_channels
+            ch["userCount"] = details["userCount"]
+            ch["hostCount"] = details["hostCount"]
+            ch["active"] = (ch["userCount"] > 0 or ch["hostCount"] > 0)
+        return channels
 
     def generate_stream_key(self, app_id: str, channel_name: str, uid: str, expires_after: int = 3600) -> str:
         """Generate stream key for push."""
@@ -77,29 +132,24 @@ class AgoraAPI:
         return response.json()["data"]["streamKey"]
 
     def generate_rtc_token(self, app_id: str, app_cert: str, channel_name: str, uid: int = 0, role: int = 2, expires_after: int = 3600) -> str:
-        """Generate RTC token (local gen; needs App Cert)."""
-        app_cert_bytes = bytes.fromhex(app_cert)
-        uid_str = str(uid)
-        current_time = int(time.time())
-        expire_time = current_time + expires_after
-        privileges = {1: expire_time}  # kJoinChannel
-        if role == 1:  # Host
-            privileges.update({2: expire_time, 3: expire_time, 4: expire_time})
-        messages_packed = pack('>H', len(privileges))
-        for k in sorted(privileges):
-            messages_packed += pack('>H', k) + pack('>I', privileges[k])
-        salt = random.randint(1, 99999999)
-        packed = pack('>I', salt) + pack('>I', current_time) + pack('>I', expire_time) + messages_packed
-        sign_content = app_id.encode('utf-8') + channel_name.encode('utf-8') + uid_str.encode('utf-8') + packed
-        signature = hmac.new(app_cert_bytes, sign_content, sha256).digest()
-        version = "006"
-        signature_b64 = b64encode(signature).decode('utf-8').rstrip('=')
-        packed_b64 = b64encode(packed).decode('utf-8').rstrip('=')
-        return f"{version}{app_id}{signature_b64}{packed_b64}"
+        """Generate RTC token using official Agora logic (needs App Cert)."""
+        token = AccessToken(app_id, app_cert, expire_time=expires_after)
+        rtc_service = ServiceRtc(channel_name, uid)
+        rtc_service.add_privilege(kJoinChannel, expires_after)
+        if role == 1:  # Host/Publisher
+            rtc_service.add_privilege(kPublishAudioStream, expires_after)
+            rtc_service.add_privilege(kPublishVideoStream, expires_after)
+            rtc_service.add_privilege(kPublishDataStream, expires_after)
+        token.add_service(rtc_service)
+        return token.build()
 
-    # Placeholder for create/delete (no API; use Console)
-    def create_project(self, name: str):
-        print("Create project not supported via API; use Agora Console.")
+    def create_project(self, name: str, enable_sign_key: bool = False) -> dict:
+        """Create a new project via API."""
+        url = "https://api.agora.io/dev/v1/project"
+        body = {"name": name, "enable_sign_key": enable_sign_key}
+        response = requests.post(url, json=body, headers=self.auth_header)
+        response.raise_for_status()
+        return response.json()
 
     def delete_project(self, app_id: str):
         print("Delete project not supported via API; use Agora Console.")
@@ -127,16 +177,52 @@ def show_menu():
     else:
         print("Agora Manager Menu:")
     options = [
-        "1: List App IDs and active streams",
+        "1: List App IDs and channels (with activity status)",
         "2: Delete App ID (Console only)",
-        "3: Add new App ID and generate key/token",
+        "3: Create new App ID",
         "4: Open stream viewer in browser",
         "5: Open Agora Console",
+        "6: Generate Stream Key for App ID",
+        "7: Generate RTC Token for App ID",
         "0: Exit"
     ]
     for opt in options:
         print(opt)
     return Prompt.ask("Choose option")
+
+def get_valid_int(prompt_msg: str, min_val: int, max_val: int) -> int:
+    """Common function to get validated integer input within range."""
+    while True:
+        try:
+            value = int(Prompt.ask(prompt_msg))
+            if min_val <= value <= max_val:
+                return value
+            else:
+                print(f"Invalid: Must be between {min_val} and {max_val}.")
+        except ValueError:
+            print("Invalid: Enter a number.")
+
+def update_env_file(key: str, value: str):
+    """Update or append to .env file."""
+    env_path = '.env'
+    if os.path.exists(env_path):
+        with open(env_path, 'r') as f:
+            lines = f.readlines()
+        updated = False
+        for i, line in enumerate(lines):
+            if line.startswith(f"{key}="):
+                lines[i] = f"{key}={value}\n"
+                updated = True
+                break
+        if not updated:
+            lines.append(f"{key}={value}\n")
+        with open(env_path, 'w') as f:
+            f.writelines(lines)
+        print(f"Updated {key} in .env.")
+    else:
+        with open(env_path, 'w') as f:
+            f.write(f"{key}={value}\n")
+        print(f"Created .env and added {key}.")
 
 def main():
     """Main CLI loop (load env, prompt fallback, menu reactive)."""
@@ -153,30 +239,49 @@ def main():
                 print("No active projects found.")
             for proj in projects:
                 app_id = proj.get("vendor_key")
-                print(f"App ID: {app_id} (Name: {proj.get('name')}, Status: Active)")
-                active_channels = api.get_active_channels(app_id)
-                if active_channels:
-                    print("Active Streams:")
-                    for ch in active_channels:
-                        print(f" - Channel: {ch['channel_name']}, Users: {ch['userCount']}, Hosts: {ch['hostCount']}, Streaming: Yes")
+                print(f"App ID: {app_id} (Project ID: {proj.get('id')}, Name: {proj.get('name')}, Status: Active)")
+                channels = api.get_channels(app_id)
+                if channels:
+                    print("  Channels (only active/online channels are listed by Agora API):")
+                    for ch in channels:
+                        active_status = "Yes" if ch["active"] else "No"
+                        print(f"    - Channel: {ch['channel_name']}, Active: {active_status}, Users: {ch['userCount']}, Hosts: {ch['hostCount']}")
                 else:
-                    print(" No active streams.")
+                    print("  No active channels.")
         elif choice == "2":
             app_id = Prompt.ask("Enter App ID to delete")
             open_console("projects")  # Open projects page
             print("Delete in Console, then press Enter when done.")
             input()
         elif choice == "3":
-            print("Create new project in Console: Set region/data center, enable Media Gateway, get App ID/Cert.")
-            open_console("projects/create")  # Open create page if exists, else projects
-            input("Press Enter after creating and enabling Media Gateway...")
-            app_id = Prompt.ask("Enter new App ID")
-            app_cert = os.getenv("AGORA_APP_CERT") or Prompt.ask("Enter App Cert (hex)")
-            channel_name = Prompt.ask("Enter Channel Name")
-            uid = Prompt.ask("Enter UID", default="1")
-            stream_key = api.generate_stream_key(app_id, channel_name, uid)
-            token = api.generate_rtc_token(app_id, app_cert, channel_name)
-            print(f"App ID: {app_id}\nStream Key: {stream_key}\nToken: {token}")
+            print("Creating new project via API.")
+            project_name = Prompt.ask("Enter Project Name")
+            enable_cert = Prompt.ask("Enable Primary App Certificate? (y/n, recommended for tokens)", default="y").lower() == "y"
+            try:
+                new_project_resp = api.create_project(project_name, enable_cert)
+                project_data = new_project_resp.get("project", {})
+                app_id = project_data.get("vendor_key")
+                app_cert = project_data.get("sign_key", "")
+                if not app_id:
+                    print(f"Failed to extract App ID from response: {new_project_resp}")
+                    continue
+                print(f"New project created! App ID: {app_id}")
+                if enable_cert:
+                    if app_cert:
+                        print(f"App Cert: {app_cert}")
+                        save_cert = Prompt.ask("Save this App Cert to .env as AGORA_APP_CERT? (y/n, overwrites if exists)", default="y").lower() == "y"
+                        if save_cert:
+                            update_env_file("AGORA_APP_CERT", app_cert)
+                    else:
+                        print("App Cert requested but not returned. Response:", new_project_resp)
+                else:
+                    print("App Cert not enabled.")
+                print("Note: New projects may take ~15 minutes to activate fully.")
+                print(f"Opening Console to enable Media Gateway (required for stream keys). In Console: My Projects > Edit '{project_name}' (App ID: {app_id}) > Enable Media Gateway > Save.")
+                open_console("projects")
+                input("Press Enter after enabling Media Gateway and waiting if needed...")
+            except requests.exceptions.HTTPError as e:
+                print(f"Error creating project: {e.response.status_code} - {e.response.text}")
         elif choice == "4":
             # Run viewer.py in background, open browser
             viewer_path = "viewer.py"  # Assume in same dir
@@ -185,7 +290,62 @@ def main():
             webbrowser.open("http://localhost:8501")
             print("Viewer opened in browser (background process).")
         elif choice == "5":
-            open_console()
+            projects = api.list_projects()
+            if not projects:
+                print("No active projects found.")
+                continue
+            print("Select Project to open Media Gateway page:")
+            for i, proj in enumerate(projects, 1):
+                print(f"{i}: App ID {proj['vendor_key']} (Project ID: {proj.get('id')}, Name: {proj['name']})")
+            select_idx = get_valid_int("Enter number", 1, len(projects)) - 1
+            selected_proj = projects[select_idx]
+            project_id = selected_proj.get('id')
+            if not project_id:
+                print("No project ID found for selected project.")
+                continue
+            media_gateway_url = f"project-management/{project_id}/media-gateway"
+            open_console(media_gateway_url)
+        elif choice == "6":
+            projects = api.list_projects()
+            if not projects:
+                print("No active projects found. Create one first.")
+                continue
+            print("Select App ID:")
+            for i, proj in enumerate(projects, 1):
+                print(f"{i}: {proj['vendor_key']} (Name: {proj['name']})")
+            select_app_idx = get_valid_int("Enter number", 1, len(projects)) - 1
+            app_id = projects[select_app_idx]['vendor_key']
+            channel_name = Prompt.ask("Enter Channel Name")
+            uid = Prompt.ask("Enter UID", default="0")
+            expires = int(Prompt.ask("Enter expires (seconds)", default="3600"))
+            try:
+                stream_key = api.generate_stream_key(app_id, channel_name, uid, expires)
+                print(f"Stream Key for App ID {app_id}, Channel {channel_name}, UID {uid}: {stream_key}")
+            except requests.exceptions.HTTPError as e:
+                print(f"Error generating stream key: {e.response.status_code} - {e.response.text}")
+        elif choice == "7":
+            projects = api.list_projects()
+            if not projects:
+                print("No active projects found. Create one first.")
+                continue
+            print("Select App ID:")
+            for i, proj in enumerate(projects, 1):
+                print(f"{i}: {proj['vendor_key']} (Name: {proj['name']})")
+            select_app_idx = get_valid_int("Enter number", 1, len(projects)) - 1
+            app_id = projects[select_app_idx]['vendor_key']
+            channel_name = Prompt.ask("Enter Channel Name")
+            app_cert = os.getenv("AGORA_APP_CERT") or Prompt.ask("Enter App Cert (hex, from Console or creation)")
+            if not app_cert:
+                print("App Cert required for RTC token. Skipping.")
+                continue
+            uid = int(Prompt.ask("Enter UID", default="0"))
+            role = int(Prompt.ask("Enter Role (1=host, 2=audience)", default="2"))
+            expires = int(Prompt.ask("Enter expires (seconds)", default="3600"))
+            try:
+                token = api.generate_rtc_token(app_id, app_cert, channel_name, uid, role, expires)
+                print(f"RTC Token for App ID {app_id}, Channel {channel_name}: {token}")
+            except Exception as e:
+                print(f"Error generating RTC token: {str(e)}")
         elif choice == "0":
             break
         else:
