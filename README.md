@@ -37,6 +37,7 @@ AGORA_APP_CERT=your_app_certificate_hex_here  # Optional: Hex string from Agora 
 ```
 
 - If `.env` is not present, scripts will prompt for inputs where needed.
+- **How to get Agora Customer Key and Secret**: Follow the instructions in the [Agora Docs](https://docs.agora.io/en/signaling/rest-api/restful-authentication) to generate them in the Agora Console under Developer Toolkit > RESTful API.
 - **Security Note**: Never commit `.env` to version control. Use environment variables in production.
 
 ## viewer.py
